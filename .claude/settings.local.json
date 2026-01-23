@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial project structure - Chatbot Commercial IPTV\n\n- Configuration Node.js + TypeScript\n- Docker Compose pour PostgreSQL et Redis\n- Structure des dossiers \\(api, services, database, utils\\)\n- Fichiers de configuration \\(config/, utils/\\)\n- Point d''entree Express avec webhooks placeholders\n- Migration SQL initiale \\(leads, conversations, messages\\)\n- Documentation \\(README.md, SETUP.md\\)\n- GitHub Actions CI workflow\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git branch:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(npm install)",
+      "Bash(docker compose:*)",
+      "Bash(npm run dev:*)",
+      "Bash(curl:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

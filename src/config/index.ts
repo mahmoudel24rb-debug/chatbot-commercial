@@ -4,6 +4,10 @@ import { z } from 'zod';
 // Charger les variables d'environnement
 dotenv.config();
 
+// Helper pour transformer les strings vides en undefined
+const optionalUrl = z.string().optional().transform((val) => val === '' ? undefined : val);
+const optionalEmail = z.string().optional().transform((val) => val === '' ? undefined : val);
+
 // Schema de validation pour les variables d'environnement
 const envSchema = z.object({
   // Application
@@ -39,9 +43,9 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(32).optional(),
   ENCRYPTION_KEY: z.string().min(32).optional(),
 
-  // Notifications
-  SLACK_WEBHOOK_URL: z.string().url().optional(),
-  NOTIFICATION_EMAIL: z.string().email().optional(),
+  // Notifications (vides acceptes)
+  SLACK_WEBHOOK_URL: optionalUrl,
+  NOTIFICATION_EMAIL: optionalEmail,
 
   // Feature flags
   ENABLE_AI_FALLBACK: z.string().transform((v) => v === 'true').default('true'),
