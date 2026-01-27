@@ -7,10 +7,20 @@ import { config } from './config/index.js';
 import { checkConnection as checkDbConnection, closePool } from './config/database.js';
 import { checkConnection as checkRedisConnection, closeConnection as closeRedis } from './config/redis.js';
 import { logger } from './utils/logger.js';
-import { AppError, formatErrorResponse, normalizeError } from './utils/errors.js';
+import { formatErrorResponse, normalizeError } from './utils/errors.js';
+import testRoutes from './api/routes/test.routes.js';
+import chatbotRoutes from './api/routes/chatbot.routes.js';
+import { aiService } from './services/ai/AIService.js';
+import { whatsappService } from './services/whatsapp/WhatsAppService.js';
+import { notificationService } from './services/notification/NotificationService.js';
+import { ghlService as _ghlService } from './services/gohighlevel/GoHighLevelService.js';
+import { twilioService } from './services/twilio/TwilioService.js';
 
 // Creer l'application Express
 const app = express();
+
+// Trust proxy pour ngrok/reverse proxy
+app.set('trust proxy', 1);
 
 // ===========================================
 // MIDDLEWARE DE SECURITE
@@ -124,13 +134,237 @@ app.get('/webhooks/whatsapp', (req: Request, res: Response) => {
   }
 });
 
-// Placeholder pour le webhook WhatsApp - Messages
-app.post('/webhooks/whatsapp', webhookLimiter, (req: Request, res: Response) => {
-  logger.info('Webhook WhatsApp recu');
-  // TODO: Implementer le traitement des messages
+// Webhook WhatsApp - Messages entrants
+app.post('/webhooks/whatsapp', webhookLimiter, async (req: Request, res: Response) => {
   // IMPORTANT: Repondre 200 immediatement pour eviter les retries
   res.status(200).json({ received: true });
+
+  try {
+    const body = req.body;
+
+    // Verifier que c'est un message WhatsApp
+    if (body.object !== 'whatsapp_business_account') {
+      return;
+    }
+
+    // Extraire les messages
+    const entries = body.entry || [];
+    for (const entry of entries) {
+      const changes = entry.changes || [];
+      for (const change of changes) {
+        if (change.field !== 'messages') continue;
+
+        const value = change.value;
+        const messages = value.messages || [];
+
+        for (const message of messages) {
+          // Ignorer les messages non-texte pour l'instant
+          if (message.type !== 'text') {
+            logger.info('Message non-texte recu', { type: message.type, from: message.from });
+            continue;
+          }
+
+          const phone = message.from;
+          const text = message.text?.body;
+
+          if (!phone || !text) continue;
+
+          logger.info('Message WhatsApp recu', { from: phone, text: text.substring(0, 50) });
+
+          // Traiter le message avec le chatbot IA
+          if (aiService.isConfigured() && whatsappService.isConfigured()) {
+            try {
+              const result = await aiService.handleIncomingMessage(phone, text);
+
+              // Envoyer la reponse
+              await whatsappService.sendTextMessage(phone, result.message);
+
+              logger.info('Reponse chatbot envoyee', {
+                to: phone,
+                state: result.context.state,
+                shouldNotifyAdmin: result.shouldNotifyAdmin,
+              });
+
+              // Envoyer notification admin si necessaire
+              if (result.shouldNotifyAdmin && result.adminNotification) {
+                logger.warn('ADMIN NOTIFICATION', {
+                  type: result.adminNotification.type,
+                  message: result.adminNotification.message,
+                });
+
+                // Envoyer la notification WhatsApp a l'admin
+                notificationService.sendAdminNotification(
+                  result.adminNotification,
+                  result.context
+                ).catch((notifError) => {
+                  logger.error('Erreur envoi notification admin', { error: notifError });
+                });
+              }
+            } catch (aiError) {
+              logger.error('Erreur traitement IA', { error: aiError, phone });
+            }
+          }
+        }
+      }
+    }
+  } catch (error) {
+    logger.error('Erreur webhook WhatsApp', { error });
+  }
 });
+
+// ===========================================
+// WEBHOOK GOHIGHLEVEL
+// ===========================================
+
+app.post('/webhooks/gohighlevel', webhookLimiter, async (req: Request, res: Response) => {
+  try {
+    const rawPayload = req.body;
+
+    // Extraire les champs selon la structure reelle de GHL
+    const contactId = rawPayload.contact_id;
+    const phone = rawPayload.phone;
+    const contactName = rawPayload.full_name || rawPayload.first_name;
+    // Le message peut etre soit un objet {type, body} soit une string
+    const message = typeof rawPayload.message === 'object'
+      ? rawPayload.message?.body
+      : rawPayload.message;
+
+    logger.info('Webhook GHL recu', {
+      phone,
+      contactId,
+      contactName,
+      message: message?.substring(0, 50),
+    });
+
+    if (!phone || !message || !contactId) {
+      logger.warn('Donnees manquantes dans payload GHL', { phone, message, contactId });
+      res.status(200).json({ received: true, reply: '' });
+      return;
+    }
+
+    // Traiter le message avec le chatbot IA
+    if (aiService.isConfigured()) {
+      try {
+        const result = await aiService.handleIncomingMessage(phone, message);
+
+        logger.info('Reponse chatbot generee', {
+          to: phone,
+          contactId,
+          contactName,
+          state: result.context.state,
+          shouldNotifyAdmin: result.shouldNotifyAdmin,
+        });
+
+        // Envoyer notification admin si necessaire (en arriere-plan)
+        if (result.shouldNotifyAdmin && result.adminNotification) {
+          logger.warn('ADMIN NOTIFICATION (GHL)', {
+            type: result.adminNotification.type,
+            message: result.adminNotification.message,
+          });
+        }
+
+        // Retourner la reponse dans le body pour que GHL puisse l'utiliser
+        res.status(200).json({
+          received: true,
+          reply: result.message,
+          contactId: contactId,
+          phone: phone,
+        });
+        return;
+
+      } catch (aiError) {
+        logger.error('Erreur traitement IA (GHL)', { error: aiError, phone, contactId });
+        res.status(200).json({ received: true, reply: '', error: 'AI error' });
+        return;
+      }
+    }
+
+    // AI non configure
+    res.status(200).json({ received: true, reply: '' });
+
+  } catch (error) {
+    logger.error('Erreur webhook GHL', { error });
+    res.status(200).json({ received: true, reply: '' });
+  }
+});
+
+// ===========================================
+// WEBHOOK TWILIO WHATSAPP
+// ===========================================
+
+app.post('/webhooks/twilio', webhookLimiter, async (req: Request, res: Response) => {
+  try {
+    const payload = req.body;
+
+    logger.info('Webhook Twilio recu', {
+      from: payload.From,
+      profileName: payload.ProfileName,
+      body: payload.Body?.substring(0, 50),
+    });
+
+    // Valider le payload
+    if (!twilioService.validateWebhookPayload(payload)) {
+      res.status(200).send('<Response></Response>');
+      return;
+    }
+
+    // Extraire le numero de telephone (enlever whatsapp:+)
+    const phone = twilioService.extractPhoneNumber(payload.From);
+    const text = payload.Body;
+
+    if (!phone || !text) {
+      res.status(200).send('<Response></Response>');
+      return;
+    }
+
+    // Traiter le message avec le chatbot IA
+    if (aiService.isConfigured() && twilioService.isConfigured()) {
+      try {
+        const result = await aiService.handleIncomingMessage(phone, text);
+
+        // Envoyer la reponse via Twilio
+        await twilioService.sendMessage(phone, result.message);
+
+        logger.info('Reponse chatbot envoyee via Twilio', {
+          to: phone,
+          state: result.context.state,
+          shouldNotifyAdmin: result.shouldNotifyAdmin,
+        });
+
+        // Envoyer notification admin si necessaire
+        if (result.shouldNotifyAdmin && result.adminNotification) {
+          logger.warn('ADMIN NOTIFICATION (Twilio)', {
+            type: result.adminNotification.type,
+            message: result.adminNotification.message,
+          });
+
+          notificationService.sendAdminNotification(
+            result.adminNotification,
+            result.context
+          ).catch((notifError) => {
+            logger.error('Erreur envoi notification admin', { error: notifError });
+          });
+        }
+      } catch (aiError) {
+        logger.error('Erreur traitement IA (Twilio)', { error: aiError, phone });
+      }
+    }
+
+    // Twilio attend une reponse TwiML vide (on repond via API)
+    res.status(200).send('<Response></Response>');
+
+  } catch (error) {
+    logger.error('Erreur webhook Twilio', { error });
+    res.status(200).send('<Response></Response>');
+  }
+});
+
+// ===========================================
+// ROUTES DE TEST
+// ===========================================
+
+app.use('/api/test', testRoutes);
+app.use('/api/chatbot', chatbotRoutes);
 
 // ===========================================
 // ROUTES API (a implementer)

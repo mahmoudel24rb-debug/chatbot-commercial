@@ -46,6 +46,16 @@ const envSchema = z.object({
   // Notifications (vides acceptes)
   SLACK_WEBHOOK_URL: optionalUrl,
   NOTIFICATION_EMAIL: optionalEmail,
+  ADMIN_PHONE: z.string().optional(),
+
+  // GoHighLevel
+  GHL_API_KEY: z.string().optional(),
+  GHL_LOCATION_ID: z.string().optional(),
+
+  // Twilio
+  TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_AUTH_TOKEN: z.string().optional(),
+  TWILIO_WHATSAPP_NUMBER: z.string().optional(),
 
   // Feature flags
   ENABLE_AI_FALLBACK: z.string().transform((v) => v === 'true').default('true'),
@@ -112,7 +122,7 @@ export const config = {
     provider: env.AI_PROVIDER,
     anthropic: {
       apiKey: env.ANTHROPIC_API_KEY,
-      model: 'claude-3-5-sonnet-20241022',
+      model: 'claude-3-haiku-20240307',
     },
     openai: {
       apiKey: env.OPENAI_API_KEY,
@@ -131,6 +141,24 @@ export const config = {
   notifications: {
     slackWebhookUrl: env.SLACK_WEBHOOK_URL,
     email: env.NOTIFICATION_EMAIL,
+  },
+
+  // Admin
+  admin: {
+    phone: env.ADMIN_PHONE,
+  },
+
+  // GoHighLevel
+  gohighlevel: {
+    apiKey: env.GHL_API_KEY,
+    locationId: env.GHL_LOCATION_ID,
+  },
+
+  // Twilio
+  twilio: {
+    accountSid: env.TWILIO_ACCOUNT_SID,
+    authToken: env.TWILIO_AUTH_TOKEN,
+    whatsappNumber: env.TWILIO_WHATSAPP_NUMBER,
   },
 
   // Feature flags
