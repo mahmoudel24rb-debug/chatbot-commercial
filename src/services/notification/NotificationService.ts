@@ -1,6 +1,6 @@
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
-import { whatsappService } from '../whatsapp/WhatsAppService.js';
+import { watiService } from '../wati/WatiService.js';
 import { CustomerContext } from '../conversation/ConversationService.js';
 
 // ===========================================
@@ -41,7 +41,7 @@ class NotificationService {
    * Check if notification service is configured
    */
   isConfigured(): boolean {
-    return !!(this.adminPhone && whatsappService.isConfigured());
+    return !!(this.adminPhone && watiService.isConfigured());
   }
 
   /**
@@ -76,7 +76,7 @@ class NotificationService {
           message = notification.message;
       }
 
-      await whatsappService.sendTextMessage(this.adminPhone, message);
+      await watiService.sendMessage(this.adminPhone,message);
 
       logger.info('Notification admin envoyee', {
         type: notification.type,
@@ -212,7 +212,7 @@ class NotificationService {
     }
 
     try {
-      await whatsappService.sendTextMessage(this.adminPhone, message);
+      await watiService.sendMessage(this.adminPhone,message);
       return true;
     } catch (error) {
       logger.error('Erreur envoi message direct admin', { error });

@@ -57,6 +57,10 @@ const envSchema = z.object({
   TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_WHATSAPP_NUMBER: z.string().optional(),
 
+  // WATI
+  WATI_API_TOKEN: z.string().optional(),
+  WATI_API_ENDPOINT: z.string().optional(),
+
   // Feature flags
   ENABLE_AI_FALLBACK: z.string().transform((v) => v === 'true').default('true'),
   DEBUG_WEBHOOKS: z.string().transform((v) => v === 'true').default('false'),
@@ -159,6 +163,12 @@ export const config = {
     accountSid: env.TWILIO_ACCOUNT_SID,
     authToken: env.TWILIO_AUTH_TOKEN,
     whatsappNumber: env.TWILIO_WHATSAPP_NUMBER,
+  },
+
+  // WATI
+  wati: {
+    apiToken: env.WATI_API_TOKEN,
+    apiEndpoint: env.WATI_API_ENDPOINT,
   },
 
   // Feature flags

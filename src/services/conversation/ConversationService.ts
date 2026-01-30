@@ -61,6 +61,7 @@ export interface CustomerContext {
   // Preferences
   contentPreference?: ContentPreference;
   wantsAdultContent?: boolean;
+  language?: 'en' | 'fr' | 'ar';
 
   // Trial info
   trialStartedAt?: Date;
@@ -132,6 +133,20 @@ export interface ProcessedMessage {
 class ConversationService {
   private conversations: Map<string, CustomerContext> = new Map();
   private messageHistory: Map<string, ConversationMessage[]> = new Map();
+
+  /**
+   * Check if a conversation context exists for this phone
+   */
+  hasContext(phone: string): boolean {
+    return this.conversations.has(phone);
+  }
+
+  /**
+   * Get all active conversation contexts
+   */
+  getAllContexts(): CustomerContext[] {
+    return Array.from(this.conversations.values());
+  }
 
   /**
    * Get or create customer context

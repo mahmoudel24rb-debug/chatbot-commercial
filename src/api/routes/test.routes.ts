@@ -159,7 +159,7 @@ router.post('/ai/intent', async (req: Request, res: Response) => {
  * GET /api/test/status
  * Verifie le statut des services
  */
-router.get('/status', (req: Request, res: Response) => {
+router.get('/status', (_req: Request, res: Response) => {
   return res.json({
     success: true,
     services: {

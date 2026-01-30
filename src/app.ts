@@ -14,7 +14,9 @@ import { aiService } from './services/ai/AIService.js';
 import { whatsappService } from './services/whatsapp/WhatsAppService.js';
 import { notificationService } from './services/notification/NotificationService.js';
 import { ghlService as _ghlService } from './services/gohighlevel/GoHighLevelService.js';
-import { twilioService } from './services/twilio/TwilioService.js';
+
+import { watiService } from './services/wati/WatiService.js';
+import { conversationService } from './services/conversation/ConversationService.js';
 
 // Creer l'application Express
 const app = express();
@@ -289,43 +291,182 @@ app.post('/webhooks/gohighlevel', webhookLimiter, async (req: Request, res: Resp
 });
 
 // ===========================================
-// WEBHOOK TWILIO WHATSAPP
+// WEBHOOK WATI WHATSAPP
 // ===========================================
 
-app.post('/webhooks/twilio', webhookLimiter, async (req: Request, res: Response) => {
+// Anti-spam: ignorer les messages deja traites (WATI replay les anciens messages au reconnect)
+const processedWatiMessages = new Set<string>();
+const serverStartTime = Date.now();
+
+app.post('/webhooks/wati', webhookLimiter, async (req: Request, res: Response) => {
   try {
     const payload = req.body;
 
-    logger.info('Webhook Twilio recu', {
-      from: payload.From,
-      profileName: payload.ProfileName,
-      body: payload.Body?.substring(0, 50),
+    logger.info('Webhook WATI recu', {
+      waId: payload.waId,
+      senderName: payload.senderName,
+      text: payload.text?.substring(0, 50),
     });
 
-    // Valider le payload
-    if (!twilioService.validateWebhookPayload(payload)) {
-      res.status(200).send('<Response></Response>');
+    const phone = payload.waId;
+    const text = payload.text;
+
+    // Si pas de waId, ignorer
+    if (!phone) {
+      res.status(200).json({ received: true });
       return;
     }
 
-    // Extraire le numero de telephone (enlever whatsapp:+)
-    const phone = twilioService.extractPhoneNumber(payload.From);
-    const text = payload.Body;
+    // Dedup: ignorer les messages deja traites (WATI replay au reconnect)
+    const rawPayload = req.body as Record<string, unknown>;
+    const messageId = (rawPayload.id as string) || `${phone}:${text || ''}:${rawPayload.timestamp || ''}`;
+    if (processedWatiMessages.has(messageId)) {
+      logger.info('Message WATI deja traite (dedup)', { phone, messageId });
+      res.status(200).json({ received: true });
+      return;
+    }
+    processedWatiMessages.add(messageId);
+    setTimeout(() => processedWatiMessages.delete(messageId), 10 * 60 * 1000);
 
-    if (!phone || !text) {
-      res.status(200).send('<Response></Response>');
+    // Ignorer les messages arrives dans les 5 premieres secondes (batch replay WATI)
+    if (Date.now() - serverStartTime < 5000) {
+      logger.info('Message ignore - demarrage du serveur (anti-replay)', { phone });
+      res.status(200).json({ received: true });
       return;
     }
 
-    // Traiter le message avec le chatbot IA
-    if (aiService.isConfigured() && twilioService.isConfigured()) {
+    // Si pas de texte (image/video/audio), essayer d'analyser l'image
+    if (!text) {
+      const mediaType = rawPayload.type as string | undefined;
+      const mediaUrl = rawPayload.data as string | undefined;
+
+      logger.info('MEDIA WEBHOOK', { phone, type: mediaType, hasUrl: !!mediaUrl });
+
+      const allowedForMedia = ['33685343973', '212695150281', '33621426352'];
+      if (allowedForMedia.includes(phone) && watiService.isConfigured() && aiService.isConfigured()) {
+        // Si c'est une image, essayer de l'analyser avec Claude Vision
+        if (mediaType === 'image' && mediaUrl) {
+          try {
+            const media = await watiService.downloadMedia(mediaUrl);
+            if (media) {
+              const extracted = await aiService.analyzeImage(media.base64, media.mediaType);
+              if (extracted) {
+                logger.info('Image analyzed - extracted text', { phone, extracted });
+
+                // Store pending confirmation and ask user to confirm
+                const context = conversationService.getOrCreateContext(phone);
+                (context as unknown as Record<string, unknown>).pendingImageData = extracted;
+                conversationService.updateContext(phone, context);
+
+                // Parse extracted data for display
+                const macMatch = extracted.match(/MAC:\s*(.+)/i);
+                const keyMatch = extracted.match(/Device Key:\s*(.+)/i);
+                let confirmMsg = "I found the following from your screenshot:\n\n";
+                if (macMatch) confirmMsg += `📍 MAC Address: ${macMatch[1].trim()}\n`;
+                if (keyMatch) confirmMsg += `🔑 Device Key: ${keyMatch[1].trim()}\n`;
+                confirmMsg += "\nIs this correct? Reply *yes* to confirm or *no* to re-send.";
+
+                await watiService.sendMessage(phone, confirmMsg);
+                res.status(200).json({ received: true });
+                return;
+              }
+            }
+          } catch (imgError) {
+            logger.error('Erreur analyse image', { error: imgError, phone });
+          }
+        }
+
+        // Fallback: image non lisible ou pas une image
+        if (conversationService.hasContext(phone)) {
+          await watiService.sendMessage(phone, "I couldn't read that image clearly. Could you type out the MAC Address and Device Key instead? 📝");
+        }
+      }
+      res.status(200).json({ received: true });
+      return;
+    }
+
+    // MODE TEST: ne repondre qu'aux numeros autorises
+    const allowedNumbers = ['33685343973', '212695150281', '33621426352'];
+    if (!allowedNumbers.includes(phone)) {
+      logger.info('Message ignore - numero non autorise (mode test)', { phone });
+      res.status(200).json({ received: true });
+      return;
+    }
+
+    const adminPhone = config.admin?.phone;
+    const isAdmin = !!(adminPhone && phone === adminPhone);
+
+    // Mode admin: repondre comme assistant business, pas comme bot client
+    if (isAdmin && aiService.isConfigured() && watiService.isConfigured()) {
+      try {
+        const result = await aiService.handleAdminMessage(phone, text);
+        await watiService.sendMessage(phone, result.message);
+        logger.info('Reponse admin envoyee via WATI', { to: phone });
+      } catch (aiError) {
+        logger.error('Erreur traitement admin (WATI)', { error: aiError, phone });
+      }
+      res.status(200).json({ received: true });
+      return;
+    }
+
+    // Si pas de contexte existant, verifier que c'est un vrai premier message (greeting)
+    // pour eviter de repondre aux conversations deja existantes apres un redemarrage
+    if (!conversationService.hasContext(phone)) {
+      const greetingsLatin = /^(hi|hello|hey|bonjour|salut|salam|yo|bonsoir|test|start|begin|hola|ciao)\b/i;
+      const greetingsArabic = /^(السلام عليكم|السلام|مرحبا|اهلا|صباح الخير|مساء الخير)/;
+      if (!greetingsLatin.test(text.trim()) && !greetingsArabic.test(text.trim())) {
+        logger.info('Message ignore - pas un premier contact (pas de greeting)', { phone, text: text.substring(0, 30) });
+        res.status(200).json({ received: true });
+        return;
+      }
+    }
+
+    // Check if user is confirming/rejecting image-extracted data
+    if (conversationService.hasContext(phone)) {
+      const ctx = conversationService.getOrCreateContext(phone);
+      const pendingData = (ctx as unknown as Record<string, unknown>).pendingImageData as string | undefined;
+      if (pendingData) {
+        const lower = text.trim().toLowerCase();
+        if (lower === 'yes' || lower === 'oui' || lower === 'y') {
+          // Confirmed - process the extracted data as a normal message
+          delete (ctx as unknown as Record<string, unknown>).pendingImageData;
+          conversationService.updateContext(phone, ctx);
+          logger.info('Image data confirmed by user', { phone, pendingData });
+
+          if (aiService.isConfigured() && watiService.isConfigured()) {
+            const result = await aiService.handleIncomingMessage(phone, pendingData);
+            await watiService.sendMessage(phone, result.message);
+            if (result.shouldNotifyAdmin && result.adminNotification) {
+              notificationService.sendAdminNotification(result.adminNotification, result.context)
+                .catch(e => logger.error('Erreur notif admin', { error: e }));
+            }
+          }
+          res.status(200).json({ received: true });
+          return;
+        } else if (lower === 'no' || lower === 'non' || lower === 'n') {
+          delete (ctx as unknown as Record<string, unknown>).pendingImageData;
+          conversationService.updateContext(phone, ctx);
+          if (watiService.isConfigured()) {
+            await watiService.sendMessage(phone, "No worries! Please send another screenshot or type the MAC Address and Device Key manually 👍");
+          }
+          res.status(200).json({ received: true });
+          return;
+        }
+        // If neither yes/no, clear pending and continue with normal flow
+        delete (ctx as unknown as Record<string, unknown>).pendingImageData;
+        conversationService.updateContext(phone, ctx);
+      }
+    }
+
+    // Traiter le message avec le chatbot IA (mode client)
+    if (aiService.isConfigured() && watiService.isConfigured()) {
       try {
         const result = await aiService.handleIncomingMessage(phone, text);
 
-        // Envoyer la reponse via Twilio
-        await twilioService.sendMessage(phone, result.message);
+        // Envoyer la reponse via WATI
+        await watiService.sendMessage(phone, result.message);
 
-        logger.info('Reponse chatbot envoyee via Twilio', {
+        logger.info('Reponse chatbot envoyee via WATI', {
           to: phone,
           state: result.context.state,
           shouldNotifyAdmin: result.shouldNotifyAdmin,
@@ -333,7 +474,7 @@ app.post('/webhooks/twilio', webhookLimiter, async (req: Request, res: Response)
 
         // Envoyer notification admin si necessaire
         if (result.shouldNotifyAdmin && result.adminNotification) {
-          logger.warn('ADMIN NOTIFICATION (Twilio)', {
+          logger.warn('ADMIN NOTIFICATION (WATI)', {
             type: result.adminNotification.type,
             message: result.adminNotification.message,
           });
@@ -346,16 +487,15 @@ app.post('/webhooks/twilio', webhookLimiter, async (req: Request, res: Response)
           });
         }
       } catch (aiError) {
-        logger.error('Erreur traitement IA (Twilio)', { error: aiError, phone });
+        logger.error('Erreur traitement IA (WATI)', { error: aiError, phone });
       }
     }
 
-    // Twilio attend une reponse TwiML vide (on repond via API)
-    res.status(200).send('<Response></Response>');
+    res.status(200).json({ received: true });
 
   } catch (error) {
-    logger.error('Erreur webhook Twilio', { error });
-    res.status(200).send('<Response></Response>');
+    logger.error('Erreur webhook WATI', { error });
+    res.status(200).json({ received: true });
   }
 });
 

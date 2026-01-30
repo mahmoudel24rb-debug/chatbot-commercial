@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
-import { BINGEBEAR_SYSTEM_PROMPT, INTENT_DETECTION_PROMPT } from '../../config/prompts.js';
+import { BINGEBEAR_SYSTEM_PROMPT, INTENT_DETECTION_PROMPT, ADMIN_SYSTEM_PROMPT } from '../../config/prompts.js';
 import {
   conversationService,
   CustomerContext,
@@ -9,6 +9,7 @@ import {
   ContentPreference,
   PlanType,
 } from '../conversation/ConversationService.js';
+import { watiService } from '../wati/WatiService.js';
 
 // ===========================================
 // TYPES
@@ -56,12 +57,25 @@ export interface ChatbotResponse {
 }
 
 // ===========================================
+// HELPERS
+// ===========================================
+
+/**
+ * Remove unpaired Unicode surrogates that break JSON serialization.
+ */
+function sanitizeString(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+}
+
+// ===========================================
 // AI SERVICE
 // ===========================================
 
 class AIService {
   private anthropic: Anthropic | null = null;
   private model: string;
+  private adminHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
   constructor() {
     this.model = config.ai.anthropic.model;
@@ -84,6 +98,76 @@ class AIService {
   }
 
   /**
+   * Analyze an image using Claude Vision to extract MAC address and Device Key
+   */
+  async analyzeImage(base64: string, mediaType: string): Promise<string | null> {
+    if (!this.anthropic) return null;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: this.model,
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+                data: base64,
+              },
+            },
+            {
+              type: 'text',
+              text: `Extract the MAC Address and Device Key from this screenshot of IBO Pro Player or a similar IPTV app.
+Reply ONLY in this exact format (no extra text):
+MAC: <mac_address>
+Device Key: <device_key>
+
+If you can only find one of them, include only that line.
+If you cannot find either, reply exactly: NOT_FOUND`,
+            },
+          ],
+        }],
+      });
+
+      const content = response.content
+        .filter(block => block.type === 'text')
+        .map(block => (block as { type: 'text'; text: string }).text)
+        .join('');
+
+      logger.info('Image analysis result', { content });
+
+      if (content.includes('NOT_FOUND')) return null;
+      return content.trim();
+    } catch (error) {
+      logger.error('Error analyzing image', { error });
+      return null;
+    }
+  }
+
+  /**
+   * Detect language from message text (simple keyword-based detection)
+   */
+  private detectLanguage(message: string): 'en' | 'fr' | 'ar' {
+    const lower = message.toLowerCase().trim();
+
+    // Arabic detection: check for Arabic Unicode characters
+    if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(message)) {
+      return 'ar';
+    }
+
+    // French detection: common French words/greetings
+    const frenchPatterns = /\b(bonjour|salut|bonsoir|merci|oui|non|je veux|s'il vous|comment|bienvenue|ça va|d'accord|svp|excusez|bonne|enchant[eé]|français|france)\b/i;
+    if (frenchPatterns.test(lower)) {
+      return 'fr';
+    }
+
+    return 'en';
+  }
+
+  /**
    * Main chatbot handler - processes incoming WhatsApp message
    */
   async handleIncomingMessage(
@@ -97,6 +181,15 @@ class AIService {
     // Get or create customer context
     const context = conversationService.getOrCreateContext(phone);
     context.lastMessageAt = new Date();
+
+    // Detect language on first messages if not set yet
+    if (!context.language) {
+      const detectedLang = this.detectLanguage(message);
+      if (detectedLang !== 'en') {
+        context.language = detectedLang;
+        logger.info('Language detected', { phone, language: detectedLang });
+      }
+    }
 
     // Add user message to history
     conversationService.addMessage(phone, {
@@ -146,413 +239,144 @@ class AIService {
   }
 
   /**
-   * Process message based on state machine logic
+   * Handle admin messages - different mode, business assistant
+   */
+  async handleAdminMessage(
+    _phone: string,
+    message: string
+  ): Promise<{ message: string }> {
+    if (!this.anthropic) {
+      throw new Error('AI service not configured');
+    }
+
+    this.adminHistory.push({ role: 'user' as const, content: message });
+
+    // Build admin context with active prospects summary
+    let adminPrompt = ADMIN_SYSTEM_PROMPT;
+    const allContexts = conversationService.getAllContexts();
+    if (allContexts.length > 0) {
+      adminPrompt += `\n\n--- PROSPECTS ACTIFS (${allContexts.length}) ---`;
+      for (const ctx of allContexts) {
+        adminPrompt += `\n📱 ${ctx.phone} | State: ${ctx.state}`;
+        if (ctx.device) adminPrompt += ` | Device: ${ctx.device}`;
+        if (ctx.macAddress) adminPrompt += ` | MAC: ${ctx.macAddress}`;
+        if (ctx.deviceKey) adminPrompt += ` | Device Key: ${ctx.deviceKey}`;
+        if (ctx.contentPreference) adminPrompt += ` | Content: ${ctx.contentPreference}`;
+        if (ctx.plan) adminPrompt += ` | Plan: ${ctx.plan}`;
+        if (ctx.createdAt) adminPrompt += ` | Depuis: ${new Date(ctx.createdAt).toLocaleString('fr-FR')}`;
+      }
+    } else {
+      adminPrompt += `\n\nAucun prospect actif pour le moment.`;
+    }
+
+    try {
+      const messages = this.adminHistory.slice(-20).map(m => ({
+        role: m.role,
+        content: sanitizeString(m.content),
+      }));
+
+      const response = await this.anthropic.messages.create({
+        model: this.model,
+        max_tokens: 500,
+        system: adminPrompt,
+        messages,
+      });
+
+      const content = response.content
+        .filter((block) => block.type === 'text')
+        .map((block) => (block as { type: 'text'; text: string }).text)
+        .join('\n');
+
+      this.adminHistory.push({ role: 'assistant' as const, content });
+
+      return { message: content };
+    } catch (error) {
+      logger.error('Error generating admin response', { error });
+      return { message: 'Erreur technique, reessaie.' };
+    }
+  }
+
+  /**
+   * Process message - let Claude AI handle all responses naturally
    */
   private async processMessage(
     context: CustomerContext,
     message: string,
     intent: IntentResult
   ): Promise<ChatbotResponse> {
-    const state = context.state;
+    // Auto-update state based on collected data
+    const prevState = context.state;
+    this.updateStateFromContext(context);
 
-    // Handle specific intents regardless of state
-    if (intent.intent === 'pricing') {
-      return this.handlePricingRequest(context);
+    // Generate natural AI response
+    const response = await this.generateAIResponse(context, message);
+
+    // Determine if admin notification is needed based on what just changed
+    const notification = this.checkForAdminNotification(context, prevState, intent, message);
+    if (notification) {
+      response.shouldNotifyAdmin = true;
+      response.adminNotification = notification;
     }
 
-    if (intent.intent === 'technical_issue') {
-      return this.handleTechnicalIssue(context, message);
-    }
-
-    // State machine
-    switch (state) {
-      case 'new':
-        return this.handleNewConversation(context, message, intent);
-
-      case 'awaiting_device':
-        return this.handleDeviceSelection(context, message, intent);
-
-      case 'awaiting_mac':
-        return this.handleMacCollection(context, message, intent);
-
-      case 'awaiting_content_pref':
-        return this.handleContentPreference(context, message, intent);
-
-      case 'trial_active':
-        return this.handleTrialActive(context, message, intent);
-
-      case 'trial_expired':
-      case 'awaiting_payment':
-        return this.handlePaymentFlow(context, message, intent);
-
-      case 'payment_pending':
-        return this.handlePaymentPending(context, message, intent);
-
-      case 'active_subscriber':
-        return this.handleActiveSubscriber(context, message, intent);
-
-      default:
-        return this.generateAIResponse(context, message);
-    }
+    return response;
   }
 
   /**
-   * Handle new conversation - first contact
+   * Auto-calculate state from collected context data
    */
-  private async handleNewConversation(
-    context: CustomerContext,
-    message: string,
-    _intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    // Check if they mentioned a device
-    const device = conversationService.extractDeviceType(message);
-
-    if (device) {
-      context.device = device;
-      context.state = 'awaiting_mac';
-
-      return {
-        message: conversationService.getSetupInstructions(device),
-        context,
-        shouldNotifyAdmin: false,
-      };
+  private updateStateFromContext(context: CustomerContext): void {
+    // Don't change state for post-trial states (managed externally)
+    if (['trial_active', 'trial_expired', 'awaiting_payment', 'payment_pending', 'active_subscriber', 'needs_human'].includes(context.state)) {
+      return;
     }
 
-    // Standard greeting
-    context.state = 'awaiting_device';
-
-    return {
-      message: `Hey! 👋 Thanks for reaching out to BingeBear.
-
-I can get you set up with a free 24-hour trial right now - full access to everything, no payment needed.
-
-Quick question: What device will you be using?
-
-📱 Android Phone/Tablet
-📺 Smart TV (Samsung, LG, etc.)
-🔥 Fire Stick
-📦 Android Box
-
-Just let me know and I'll send the setup instructions!`,
-      context,
-      shouldNotifyAdmin: false,
-    };
-  }
-
-  /**
-   * Handle device selection
-   */
-  private async handleDeviceSelection(
-    context: CustomerContext,
-    message: string,
-    intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    const device = intent.entities.device || conversationService.extractDeviceType(message);
-
-    if (device) {
-      context.device = device;
-      context.state = 'awaiting_mac';
-
-      return {
-        message: conversationService.getSetupInstructions(device),
-        context,
-        shouldNotifyAdmin: false,
-      };
-    }
-
-    // Couldn't identify device
-    return {
-      message: `No problem! What device are you using exactly?
-
-📱 Android Phone/Tablet
-📺 Smart TV (Samsung, LG, Sony, etc.)
-🔥 Fire Stick
-📦 Android Box
-💻 Other
-
-Just let me know!`,
-      context,
-      shouldNotifyAdmin: false,
-    };
-  }
-
-  /**
-   * Handle MAC address collection
-   */
-  private async handleMacCollection(
-    context: CustomerContext,
-    message: string,
-    intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    // Check for MAC address in message
-    const mac = intent.entities.mac_address || conversationService.extractMacAddress(message);
-
-    // Check if they're asking about TiviMate
-    if (message.toLowerCase().includes('tivimate') || message.toLowerCase().includes('tivi mate')) {
-      context.device = 'tivimate';
+    if (context.device && (context.macAddress || context.deviceKey) && context.contentPreference) {
+      context.state = 'trial_pending';
+    } else if (context.device && (context.macAddress || context.deviceKey)) {
       context.state = 'awaiting_content_pref';
-
-      return {
-        message: `Ah, you've got TiviMate! Great choice 👍
-
-I'll send you the login details (Username, Password, URL) instead.
-
-Which content do you want?
-🇮🇪 English only (IE/UK/USA/CA/AU)
-🌍 Europe
-🌎 Worldwide (everything)
-🔞 Adult content? (just let me know)`,
-        context,
-        shouldNotifyAdmin: false,
-      };
+    } else if (context.device) {
+      context.state = 'awaiting_mac';
+    } else if (context.state === 'new') {
+      context.state = 'awaiting_device';
     }
-
-    // Check if message looks like it contains MAC/device info (screenshot or text)
-    if (mac || message.length > 10 || message.includes(':') || /[0-9a-f]{6,}/i.test(message)) {
-      // Looks like they sent device info
-      context.macAddress = mac || message;
-      context.state = 'awaiting_content_pref';
-
-      return {
-        message: `Perfect! Got your device details ✅
-
-One last thing before I activate your trial:
-
-What content are you most interested in?
-🇮🇪 English channels (Ireland, UK, USA, CA, etc.)
-🌍 Europe
-🌎 Worldwide (everything)
-🔞 Adult content? (just let me know)
-
-This helps me set up exactly what you want to test!`,
-        context,
-        shouldNotifyAdmin: false,
-      };
-    }
-
-    // They might be stuck
-    return {
-      message: `No worries! Having trouble finding the MAC address?
-
-Open IBO Pro Player - you should see a screen with:
-- MAC Address
-- Device Key
-
-Just send me a screenshot of that screen, or type the numbers you see.
-
-Need help with any step? I'm here! 👍`,
-      context,
-      shouldNotifyAdmin: false,
-    };
   }
 
   /**
-   * Handle content preference selection
+   * Check if admin notification is needed after processing
    */
-  private async handleContentPreference(
+  private checkForAdminNotification(
     context: CustomerContext,
-    message: string,
-    intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    const pref = intent.entities.content_preference || conversationService.extractContentPreference(message);
-
-    // Check for adult content request
-    if (message.toLowerCase().includes('adult') || message.toLowerCase().includes('xxx') || message.toLowerCase().includes('porn')) {
-      context.wantsAdultContent = true;
-    }
-
-    if (pref) {
-      context.contentPreference = pref;
-    } else {
-      context.contentPreference = 'english'; // Default
-    }
-
-    context.state = 'trial_pending';
-
-    // Notify admin to activate trial
-    return {
-      message: `Perfect! I'm setting up your trial now...
-
-You'll be watching in about 2 minutes! I'll message you as soon as it's ready 👍`,
-      context,
-      shouldNotifyAdmin: true,
-      adminNotification: {
+    prevState: string,
+    intent: IntentResult,
+    message: string
+  ): ChatbotResponse['adminNotification'] | undefined {
+    // Trial request: just transitioned to trial_pending
+    if (context.state === 'trial_pending' && prevState !== 'trial_pending') {
+      return {
         type: 'trial_request',
         message: conversationService.createTrialNotification(context),
-      },
-    };
-  }
-
-  /**
-   * Handle messages during active trial
-   */
-  private async handleTrialActive(
-    context: CustomerContext,
-    message: string,
-    intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    // Check if asking about pricing/plans
-    if (intent.intent === 'pricing' || message.toLowerCase().includes('price') || message.toLowerCase().includes('plan')) {
-      return this.handlePricingRequest(context);
-    }
-
-    // Check if ready to subscribe
-    if (intent.intent === 'payment' || message.toLowerCase().includes('yes') || message.toLowerCase().includes('subscribe') || message.toLowerCase().includes('buy')) {
-      context.state = 'awaiting_payment';
-      return this.handlePaymentFlow(context, message, intent);
-    }
-
-    // General question during trial
-    return this.generateAIResponse(context, message);
-  }
-
-  /**
-   * Handle pricing request
-   */
-  private handlePricingRequest(context: CustomerContext): ChatbotResponse {
-    const pricing = conversationService.getPricingMessage(context.plan);
-    context.state = 'awaiting_payment';
-
-    return {
-      message: pricing,
-      context,
-      shouldNotifyAdmin: false,
-    };
-  }
-
-  /**
-   * Handle payment flow
-   */
-  private async handlePaymentFlow(
-    context: CustomerContext,
-    message: string,
-    _intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    const lower = message.toLowerCase();
-
-    // Detect payment method preference
-    if (lower.includes('revolut') || lower.includes('bank') || lower.includes('iban')) {
-      context.paymentMethod = 'revolut';
-      return {
-        message: conversationService.getPaymentInstructions('revolut'),
-        context,
-        shouldNotifyAdmin: false,
       };
     }
 
-    if (lower.includes('paypal')) {
-      context.paymentMethod = 'paypal';
-      return {
-        message: conversationService.getPaymentInstructions('paypal'),
-        context,
-        shouldNotifyAdmin: false,
-      };
-    }
-
-    // Detect plan selection
-    if (lower.includes('lifetime')) {
-      context.plan = 'lifetime';
-    } else if (lower.includes('2 year') || lower.includes('two year')) {
-      context.plan = '2years';
-    } else if (lower.includes('3 year') || lower.includes('three year')) {
-      context.plan = '3years';
-    } else if (lower.includes('year')) {
-      context.plan = 'yearly';
-    } else if (lower.includes('month')) {
-      context.plan = 'monthly';
-    }
-
-    // Check if confirming payment sent
-    if (conversationService.isPaymentConfirmation(message)) {
+    // Payment confirmation
+    if (intent.intent === 'payment' && conversationService.isPaymentConfirmation(message)) {
       context.state = 'payment_pending';
       context.paymentPending = true;
-
       return {
-        message: `Got it! Let me verify the payment...
-
-Can you send me a screenshot of the payment receipt please? ✅`,
-        context,
-        shouldNotifyAdmin: true,
-        adminNotification: {
-          type: 'payment_received',
-          message: conversationService.createPaymentNotification(context),
-        },
+        type: 'payment_received',
+        message: conversationService.createPaymentNotification(context),
       };
     }
 
-    // Show payment options
-    return {
-      message: `Great choice${context.plan ? ` on the ${conversationService.formatPlanName(context.plan)}` : ''}! 🎉
-
-Which payment method works best for you?
-
-💳 Revolut/Bank Transfer
-📱 PayPal
-
-Let me know and I'll send the details!`,
-      context,
-      shouldNotifyAdmin: false,
-    };
-  }
-
-  /**
-   * Handle payment pending verification
-   */
-  private handlePaymentPending(
-    context: CustomerContext,
-    message: string,
-    _intent: IntentResult
-  ): Promise<ChatbotResponse> {
-    // Waiting for admin to verify
-    return Promise.resolve({
-      message: `Thanks! I'm just verifying the payment now - will confirm in a moment 👍`,
-      context,
-      shouldNotifyAdmin: true,
-      adminNotification: {
-        type: 'payment_received',
-        message: `📸 Customer sent what looks like a receipt:\n\n"${message.substring(0, 100)}..."\n\nPhone: ${context.phone}\nPlan: ${context.plan}\n\nPlease verify and activate.`,
-      },
-    });
-  }
-
-  /**
-   * Handle active subscriber messages
-   */
-  private handleActiveSubscriber(
-    context: CustomerContext,
-    message: string,
-    intent: IntentResult
-  ): Promise<ChatbotResponse> {
+    // Technical issue
     if (intent.intent === 'technical_issue') {
-      return this.handleTechnicalIssue(context, message);
+      return {
+        type: 'technical_issue',
+        message: `⚠️ TECHNICAL ISSUE\n\nCustomer: ${context.phone}\nDevice: ${context.device || 'Unknown'}\n\nIssue: "${message}"`,
+      };
     }
 
-    return this.generateAIResponse(context, message);
-  }
-
-  /**
-   * Handle technical issues
-   */
-  private handleTechnicalIssue(
-    context: CustomerContext,
-    message: string
-  ): Promise<ChatbotResponse> {
-    return Promise.resolve({
-      message: `On it! Let me check what's happening.
-
-Quick questions:
-1. Which channel/content is having issues?
-2. What device are you using?
-3. Is your internet working okay for other things?
-
-I'll get this sorted for you right away 👍`,
-      context,
-      shouldNotifyAdmin: true,
-      adminNotification: {
-        type: 'technical_issue',
-        message: `⚠️ TECHNICAL ISSUE\n\nCustomer: ${context.phone}\nPlan: ${context.plan || 'Trial'}\nDevice: ${context.device || 'Unknown'}\n\nIssue: "${message}"`,
-      },
-    });
+    return undefined;
   }
 
   /**
@@ -566,16 +390,39 @@ I'll get this sorted for you right away 👍`,
       throw new Error('AI service not configured');
     }
 
-    const history = conversationService.getHistory(context.phone, 10);
-    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = history
-      .filter(m => m.role !== 'system')
-      .map(m => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-      }));
+    // Try to fetch real conversation history from WATI (includes human agent messages)
+    let messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
-    // Add current message
-    messages.push({ role: 'user', content: message });
+    if (watiService.isConfigured()) {
+      const watiHistory = await watiService.getRecentMessages(context.phone, 10);
+      if (watiHistory.length > 0) {
+        messages = watiHistory.map(m => ({
+          role: m.role,
+          content: sanitizeString(m.content),
+        }));
+        logger.info('Using WATI history', { phone: context.phone, messageCount: messages.length });
+      }
+    }
+
+    // Fallback to in-memory history if WATI fetch failed
+    if (messages.length === 0) {
+      const history = conversationService.getHistory(context.phone, 10);
+      messages = history
+        .filter(m => m.role !== 'system')
+        .map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: sanitizeString(m.content),
+        }));
+    }
+
+    // Add current message (only if not already the last message in WATI history)
+    const lastMsg = messages[messages.length - 1];
+    if (!lastMsg || lastMsg.role !== 'user' || lastMsg.content !== sanitizeString(message)) {
+      messages.push({ role: 'user', content: sanitizeString(message) });
+    }
+
+    // Ensure messages alternate correctly (Claude API requirement)
+    messages = this.ensureAlternatingRoles(messages);
 
     // Build context-aware system prompt
     const systemPrompt = this.buildContextualPrompt(context);
@@ -583,7 +430,7 @@ I'll get this sorted for you right away 👍`,
     try {
       const response = await this.anthropic.messages.create({
         model: this.model,
-        max_tokens: 500,
+        max_tokens: 200,
         system: systemPrompt,
         messages,
       });
@@ -615,6 +462,34 @@ I'll get this sorted for you right away 👍`,
   /**
    * Build contextual system prompt
    */
+  /**
+   * Ensure messages alternate user/assistant (Claude API requirement).
+   * Merges consecutive same-role messages and ensures it starts with 'user'.
+   */
+  private ensureAlternatingRoles(
+    msgs: Array<{ role: 'user' | 'assistant'; content: string }>
+  ): Array<{ role: 'user' | 'assistant'; content: string }> {
+    if (msgs.length === 0) return msgs;
+
+    // Merge consecutive same-role messages
+    const merged: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+    for (const msg of msgs) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === msg.role) {
+        last.content += '\n' + msg.content;
+      } else {
+        merged.push({ ...msg });
+      }
+    }
+
+    // Ensure starts with 'user'
+    if (merged.length > 0 && merged[0].role !== 'user') {
+      merged.shift();
+    }
+
+    return merged;
+  }
+
   private buildContextualPrompt(context: CustomerContext): string {
     let prompt = BINGEBEAR_SYSTEM_PROMPT;
 
@@ -627,8 +502,17 @@ I'll get this sorted for you right away 👍`,
     if (context.device) {
       prompt += `\nDevice: ${context.device}`;
     }
+    if (context.macAddress) {
+      prompt += `\nMAC Address: ${context.macAddress}`;
+    }
+    if (context.deviceKey) {
+      prompt += `\nDevice Key: ${context.deviceKey}`;
+    }
     if (context.contentPreference) {
       prompt += `\nContent Preference: ${context.contentPreference}`;
+    }
+    if (context.wantsAdultContent) {
+      prompt += `\nAdult Content: Yes`;
     }
     if (context.plan) {
       prompt += `\nInterested Plan: ${context.plan}`;
@@ -638,7 +522,41 @@ I'll get this sorted for you right away 👍`,
       prompt += `\nTrial: Active (${hoursLeft.toFixed(1)} hours remaining)`;
     }
 
-    prompt += `\n\nRespond naturally as Joe. Keep it short and WhatsApp-friendly.`;
+    // Dynamic instructions based on what's missing
+    const missing: string[] = [];
+    if (!context.device) missing.push('device type (Fire Stick, Smart TV, Android Phone, Android Box)');
+    if (context.device && !context.macAddress && !context.deviceKey) missing.push('MAC Address and Device Key (ask them to open IBO Pro Player and send a screenshot or type the values)');
+    if (context.device && (context.macAddress || context.deviceKey) && !context.contentPreference) missing.push('content preference (English only, Europe, or Worldwide)');
+
+    if (missing.length > 0) {
+      prompt += `\n\nINFO STILL NEEDED (ask naturally, don't force a rigid order - if the customer provides multiple pieces of info at once, accept them all):`;
+      missing.forEach(m => { prompt += `\n- ${m}`; });
+    }
+
+    if (context.state === 'trial_pending') {
+      prompt += `\n\nAll info collected! Tell the customer their trial is being set up and they'll be watching in about 2 minutes.`;
+    }
+
+    if (context.state === 'payment_pending') {
+      prompt += `\n\nPayment was sent. Tell the customer you're verifying it and will confirm shortly.`;
+    }
+
+    if (context.state === 'needs_human') {
+      prompt += `\n\nThis customer has been escalated to a human agent. Keep responses VERY short (1-2 lines max). Just say a team member will be in touch shortly. Do NOT try to solve their problem, do NOT give contact info or phone numbers, do NOT apologize excessively.`;
+    }
+
+    // Language instruction
+    if (context.language && context.language !== 'en') {
+      const langName = context.language === 'fr' ? 'French' : 'Arabic';
+      prompt += `\n\nLANGUAGE: The customer prefers ${langName}. You MUST reply entirely in ${langName}. Keep the same friendly tone.`;
+    }
+
+    prompt += `\n\nCRITICAL RULES:
+- MAX 3-4 short lines per message. This is WhatsApp, NOT email.
+- NEVER list what's included (channels, movies, sports) - the customer doesn't need that.
+- NEVER recap info you already have - just move forward.
+- Be concise like a real WhatsApp chat. One emoji max.
+- If the customer provides info, acknowledge briefly and ask the next thing needed.`;
 
     return prompt;
   }
@@ -657,7 +575,7 @@ I'll get this sorted for you right away 👍`,
       };
     }
 
-    const prompt = INTENT_DETECTION_PROMPT.replace('{message}', message);
+    const prompt = INTENT_DETECTION_PROMPT.replace('{message}', sanitizeString(message));
 
     try {
       const response = await this.anthropic.messages.create({
@@ -694,26 +612,68 @@ I'll get this sorted for you right away 👍`,
   private updateContextFromIntent(
     context: CustomerContext,
     intent: IntentResult,
-    _message: string
+    message: string
   ): void {
     context.sentiment = intent.sentiment;
 
-    if (intent.entities.device) {
+    // Helper to check if value is a real value (not null/undefined/"null"/"none")
+    const isValid = (val: unknown): val is string =>
+      typeof val === 'string' && val !== 'null' && val !== 'none' && val !== 'N/A' && val.length > 0;
+
+    // Detect adult content request from raw message
+    const lower = message.toLowerCase();
+    if (lower.includes('adult') || lower.includes('xxx') || lower.includes('porn')) {
+      context.wantsAdultContent = true;
+    }
+
+    // Also try to extract MAC from raw message if intent didn't catch it
+    if (!context.macAddress) {
+      const extractedMac = conversationService.extractMacAddress(message);
+      if (extractedMac) {
+        context.macAddress = extractedMac;
+      }
+    }
+
+    // Also try to extract device key from raw message
+    if (!context.deviceKey) {
+      const keyMatch = message.match(/device\s*key[:\s]*([A-Za-z0-9]+)/i);
+      if (keyMatch) {
+        context.deviceKey = keyMatch[1];
+      }
+    }
+
+    // Also try to extract content preference from raw message
+    if (!context.contentPreference) {
+      const extractedPref = conversationService.extractContentPreference(message);
+      if (extractedPref) {
+        context.contentPreference = extractedPref;
+      }
+    }
+
+    // Also try to extract device from raw message
+    if (!context.device) {
+      const extractedDevice = conversationService.extractDeviceType(message);
+      if (extractedDevice) {
+        context.device = extractedDevice;
+      }
+    }
+
+    if (isValid(intent.entities.device) && !context.device) {
       context.device = intent.entities.device;
     }
-    if (intent.entities.plan_interest) {
+    if (isValid(intent.entities.plan_interest) && !context.plan) {
       context.plan = intent.entities.plan_interest;
     }
-    if (intent.entities.content_preference) {
+    if (isValid(intent.entities.content_preference) && !context.contentPreference) {
       context.contentPreference = intent.entities.content_preference;
     }
-    if (intent.entities.mac_address) {
+    if (isValid(intent.entities.mac_address) && !context.macAddress) {
       context.macAddress = intent.entities.mac_address;
     }
-    if (intent.entities.device_key) {
+    if (isValid(intent.entities.device_key) && !context.deviceKey) {
       context.deviceKey = intent.entities.device_key;
     }
-    if (intent.entities.payment_method) {
+    if (isValid(intent.entities.payment_method) && !context.paymentMethod) {
       context.paymentMethod = intent.entities.payment_method;
     }
   }
@@ -855,7 +815,7 @@ Thanks mate! Enjoy unlimited streaming 🍿📺`,
 
     const response = await this.anthropic.messages.create({
       model: this.model,
-      max_tokens: 500,
+      max_tokens: 150,
       system: BINGEBEAR_SYSTEM_PROMPT,
       messages,
     });

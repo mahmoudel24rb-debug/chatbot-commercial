@@ -16,7 +16,7 @@ export function normalizePhoneNumber(phone: string): string {
   // Si le numero ne commence pas par +, ajouter +
   if (!normalized.startsWith('+')) {
     // Assumer format francais si 9 chiffres
-    if (normalized.length === 9 && normalized.startsWith('6' || '7')) {
+    if (normalized.length === 9 && (normalized.startsWith('6') || normalized.startsWith('7'))) {
       normalized = '+33' + normalized;
     } else if (normalized.startsWith('33')) {
       normalized = '+' + normalized;
