@@ -12,7 +12,19 @@
       "Bash(docker compose:*)",
       "Bash(npm run dev:*)",
       "Bash(curl:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git fetch:*)",
+      "Bash(timeout /t 3 /nobreak)",
+      "Bash(ping:*)",
+      "Bash(npx tsx:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(taskkill:*)",
+      "Bash(powershell -Command \"Invoke-RestMethod -Uri ''http://localhost:3000/api/test/whatsapp'' -Method POST -ContentType ''application/json'' -Body ''{\"\"to\"\": \"\"+33685343973\"\", \"\"message\"\": \"\"Bonjour ! Ceci est un test du chatbot IPTV.\"\"}''\")",
+      "Bash(npx tsc:*)",
+      "Bash(powershell -Command \"Invoke-RestMethod -Uri ''https://graph.facebook.com/v19.0/1011606982028991/messages'' -Method Post -Headers @{Authorization=''Bearer EAAKu7NyhZAoUBQtXpdIuKD7qPepZAC21azFVrWQBG1QlQDw55M8NRlqdbDn1aHHBUR3hZCs27m4vdPeXB2cuXWluXyx04jl209pGIw3qajJZB94c8yQh7XEPrJOe0ZAC5nGIcIDP3mZBlyheon94b9hSBx3HwF3sJpZA79eC5cyP3ShOeD9YWpGubVNqFZAW3W62yb342kDAInMH9U704nafXtWLm4DamZANjJbtqLUYGK7qBtZCmHau3sXglZBu3xhZB6qvxeQSZBWTcu5btDGLgCNCCymUq3HZAxlZCAOLWiyeQZDZD''} -ContentType ''application/json'' -Body ''{\"\"messaging_product\"\":\"\"whatsapp\"\",\"\"to\"\":\"\"33685343973\"\",\"\"type\"\":\"\"template\"\",\"\"template\"\":{\"\"name\"\":\"\"hello_world\"\",\"\"language\"\":{\"\"code\"\":\"\"en_US\"\"}}}''\")",
+      "Bash(npm run build:*)",
+      "WebFetch(domain:docs.wati.io)"
     ]
   }
 }
